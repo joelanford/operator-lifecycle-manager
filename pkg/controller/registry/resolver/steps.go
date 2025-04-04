@@ -2,8 +2,11 @@ package resolver
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 
 	olmerrors "github.com/operator-framework/operator-lifecycle-manager/pkg/controller/errors"
@@ -201,7 +204,8 @@ func NewServiceAccountStepResources(csv *v1alpha1.ClusterServiceVersion, catalog
 		return nil, err
 	}
 
-	for _, perms := range operatorPermissions {
+	for _, saName := range slices.SortedFunc(maps.Keys(operatorPermissions), cmp.Compare) {
+		perms := operatorPermissions[saName]
 		if perms.ServiceAccount.Name != "default" {
 			step, err := NewStepResourceFromObject(perms.ServiceAccount, catalogSourceName, catalogSourceNamespace)
 			if err != nil {

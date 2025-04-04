@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -579,6 +580,7 @@ func (c *ConfigMapUnpacker) UnpackBundle(lookup *operatorsv1alpha1.BundleLookup,
 	if result.Bundle() == nil || len(result.Bundle().GetObject()) == 0 {
 		return
 	}
+	slices.Sort(result.bundle.Object)
 
 	if result.BundleLookup.Properties != "" {
 		props, err := projection.PropertyListFromPropertiesAnnotation(lookup.Properties)

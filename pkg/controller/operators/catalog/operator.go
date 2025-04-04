@@ -1,11 +1,14 @@
 package catalog
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -1615,6 +1618,8 @@ func (o *Operator) setIPReference(subs []*v1alpha1.Subscription, gen int, instal
 	return subs
 }
 
+const AnnotationInstallPlanContentHash = "olm.content-hash"
+
 func (o *Operator) ensureInstallPlan(logger *logrus.Entry, namespace string, gen int, subs []*v1alpha1.Subscription, installPlanApproval v1alpha1.Approval, steps []*v1alpha1.Step, bundleLookups []v1alpha1.BundleLookup) (*corev1.ObjectReference, error) {
 	if len(steps) == 0 && len(bundleLookups) == 0 {
 		return nil, nil
@@ -1625,7 +1630,16 @@ func (o *Operator) ensureInstallPlan(logger *logrus.Entry, namespace string, gen
 	if err != nil {
 		return nil, err
 	}
-
+	var latestInstallPlan *v1alpha1.InstallPlan
+	if len(installPlans) > 0 {
+		slices.SortFunc(installPlans, func(a, b *v1alpha1.InstallPlan) int {
+			if d := cmp.Compare(b.Spec.Generation, a.Spec.Generation); d != 0 {
+				return d
+			}
+			return b.CreationTimestamp.Compare(a.CreationTimestamp.Time)
+		})
+		latestInstallPlan = installPlans[0]
+	}
 	// There are multiple(2) worker threads process the namespaceQueue.
 	// Both worker can work at the same time when 2 separate updates are made for the namespace.
 	// The following sequence causes 2 installplans are created for a subscription
@@ -1651,62 +1665,89 @@ func (o *Operator) ensureInstallPlan(logger *logrus.Entry, namespace string, gen
 			return reference.GetReference(installPlan)
 		}
 	}
-	logger.Warn("no installplan found with matching generation, creating new one")
-
-	return o.createInstallPlan(namespace, gen, subs, installPlanApproval, steps, bundleLookups)
+	return o.createInstallPlan(logger, namespace, latestInstallPlan, gen, subs, installPlanApproval, steps, bundleLookups)
 }
 
-func (o *Operator) createInstallPlan(namespace string, gen int, subs []*v1alpha1.Subscription, installPlanApproval v1alpha1.Approval, steps []*v1alpha1.Step, bundleLookups []v1alpha1.BundleLookup) (*corev1.ObjectReference, error) {
+func (o *Operator) createInstallPlan(logger *logrus.Entry, namespace string, latestInstallPlan *v1alpha1.InstallPlan, gen int, subs []*v1alpha1.Subscription, installPlanApproval v1alpha1.Approval, steps []*v1alpha1.Step, bundleLookups []v1alpha1.BundleLookup) (*corev1.ObjectReference, error) {
 	if len(steps) == 0 && len(bundleLookups) == 0 {
 		return nil, nil
 	}
 
-	csvNames := []string{}
-	catalogSourceMap := map[string]struct{}{}
+	csvNamesSet := sets.New[string]()
+	catalogSourcesSet := sets.New[string]()
 	for _, s := range steps {
 		if s.Resource.Kind == "ClusterServiceVersion" {
-			csvNames = append(csvNames, s.Resource.Name)
+			csvNamesSet.Insert(s.Resource.Name)
 		}
-		catalogSourceMap[s.Resource.CatalogSource] = struct{}{}
+		catalogSourcesSet.Insert(s.Resource.CatalogSource)
+	}
+	csvNames := sets.List(csvNamesSet)
+	catalogSources := sets.List(catalogSourcesSet)
+
+	hasher := fnv.New64a()
+	enc := json.NewEncoder(hasher)
+	for _, item := range []any{
+		csvNames,
+		catalogSources,
+		steps,
+		bundleLookups,
+	} {
+		if err := enc.Encode(item); err != nil {
+			return nil, err
+		}
+	}
+	desiredContentHash := fmt.Sprintf("%x", hasher.Sum(nil))
+
+	needCreate := false
+	var res = latestInstallPlan
+	if res == nil {
+		logger.Warn("no installplan found with matching generation, creating new one")
+		needCreate = true
+	} else if desiredContentHash != res.Annotations[AnnotationInstallPlanContentHash] {
+		logger.Warn("installplan found with mismatched content hash, creating new one")
+		needCreate = true
+	} else {
+		logger.Infof("latest install plan has desired content hash: skipping creation")
 	}
 
-	catalogSources := []string{}
-	for s := range catalogSourceMap {
-		catalogSources = append(catalogSources, s)
+	if needCreate {
+		ip := &v1alpha1.InstallPlan{
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName: "install-",
+				Namespace:    namespace,
+				Annotations: map[string]string{
+					AnnotationInstallPlanContentHash: desiredContentHash,
+				},
+			},
+			Spec: v1alpha1.InstallPlanSpec{
+				ClusterServiceVersionNames: csvNames,
+				Approval:                   installPlanApproval,
+				Approved:                   installPlanApproval == v1alpha1.ApprovalAutomatic,
+				Generation:                 gen,
+			},
+		}
+		for _, sub := range subs {
+			ownerutil.AddNonBlockingOwner(ip, sub)
+		}
+		var err error
+		res, err = o.client.OperatorsV1alpha1().InstallPlans(namespace).Create(context.TODO(), ip, metav1.CreateOptions{})
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	phase := v1alpha1.InstallPlanPhaseInstalling
-	if installPlanApproval == v1alpha1.ApprovalManual {
-		phase = v1alpha1.InstallPlanPhaseRequiresApproval
-	}
-	ip := &v1alpha1.InstallPlan{
-		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: "install-",
-			Namespace:    namespace,
-		},
-		Spec: v1alpha1.InstallPlanSpec{
-			ClusterServiceVersionNames: csvNames,
-			Approval:                   installPlanApproval,
-			Approved:                   installPlanApproval == v1alpha1.ApprovalAutomatic,
-			Generation:                 gen,
-		},
-	}
-	for _, sub := range subs {
-		ownerutil.AddNonBlockingOwner(ip, sub)
+	if res.Status.Phase == "" {
+		res.Status.Phase = v1alpha1.InstallPlanPhaseInstalling
+		if installPlanApproval == v1alpha1.ApprovalManual {
+			res.Status.Phase = v1alpha1.InstallPlanPhaseRequiresApproval
+		}
 	}
 
-	res, err := o.client.OperatorsV1alpha1().InstallPlans(namespace).Create(context.TODO(), ip, metav1.CreateOptions{})
-	if err != nil {
-		return nil, err
-	}
+	res.Status.Plan = steps
+	res.Status.CatalogSources = catalogSources
+	res.Status.BundleLookups = bundleLookups
 
-	res.Status = v1alpha1.InstallPlanStatus{
-		Phase:          phase,
-		Plan:           steps,
-		CatalogSources: catalogSources,
-		BundleLookups:  bundleLookups,
-	}
-	res, err = o.client.OperatorsV1alpha1().InstallPlans(namespace).UpdateStatus(context.TODO(), res, metav1.UpdateOptions{})
+	res, err := o.client.OperatorsV1alpha1().InstallPlans(namespace).UpdateStatus(context.TODO(), res, metav1.UpdateOptions{})
 	if err != nil {
 		return nil, err
 	}
