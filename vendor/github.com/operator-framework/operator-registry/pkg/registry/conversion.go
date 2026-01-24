@@ -27,7 +27,52 @@ func PackageManifestToAPIPackage(manifest *PackageManifest) *api.Package {
 		DefaultChannelName: manifest.DefaultChannelName,
 		Channels:           channels,
 		Deprecation:        deprecation,
+		VersionLifecycles:  versionLifecyclesToAPI(manifest.VersionLifecycles),
 	}
+}
+
+func versionLifecyclesToAPI(in []VersionLifecycle) []*api.VersionLifecycle {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]*api.VersionLifecycle, len(in))
+	for i, lc := range in {
+		out[i] = &api.VersionLifecycle{
+			Version:       lc.Version,
+			Compatibility: compatibilityToAPI(lc.Compatibility),
+			Phases:        phasesToAPI(lc.Phases),
+		}
+	}
+	return out
+}
+
+func compatibilityToAPI(in []PlatformCompatibility) []*api.PlatformCompatibility {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]*api.PlatformCompatibility, len(in))
+	for i, pc := range in {
+		out[i] = &api.PlatformCompatibility{
+			Platform: pc.Platform,
+			Versions: pc.Versions,
+		}
+	}
+	return out
+}
+
+func phasesToAPI(in []LifecyclePhase) []*api.LifecyclePhase {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]*api.LifecyclePhase, len(in))
+	for i, phase := range in {
+		out[i] = &api.LifecyclePhase{
+			Name:      phase.Name,
+			StartDate: phase.StartDate,
+			EndDate:   phase.EndDate,
+		}
+	}
+	return out
 }
 
 func PackageChannelToAPIChannel(channel *PackageChannel) *api.Channel {

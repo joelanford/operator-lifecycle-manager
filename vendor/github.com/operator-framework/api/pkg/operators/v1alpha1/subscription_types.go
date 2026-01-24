@@ -242,6 +242,14 @@ type SubscriptionStatus struct {
 
 	// LastUpdated represents the last time that the Subscription status was updated.
 	LastUpdated metav1.Time `json:"lastUpdated"`
+
+	// Lifecycle contains lifecycle status information for the installed operator version.
+	// +optional
+	Lifecycle *SubscriptionLifecycleStatus `json:"lifecycle,omitempty"`
+
+	// Compatibility contains platform compatibility information from the catalog.
+	// +optional
+	Compatibility *SubscriptionCompatibility `json:"compatibility,omitempty"`
 }
 
 // GetCondition returns the SubscriptionCondition of the given type if it exists in the SubscriptionStatus' Conditions.
@@ -313,6 +321,34 @@ type SubscriptionCatalogHealth struct {
 // Equality is based SOLEY on health and UID.
 func (s SubscriptionCatalogHealth) Equals(health SubscriptionCatalogHealth) bool {
 	return s.Healthy == health.Healthy && s.CatalogSourceRef.UID == health.CatalogSourceRef.UID
+}
+
+// SubscriptionLifecycleStatus contains lifecycle information for the installed operator version.
+type SubscriptionLifecycleStatus struct {
+	// CurrentPhase is the current lifecycle phase (e.g., tech-preview, GA, maintenance, deprecated, EOL)
+	// +optional
+	CurrentPhase string `json:"currentPhase,omitempty"`
+	// CurrentPhaseEndDate is when the current phase ends
+	// +optional
+	CurrentPhaseEndDate *metav1.Time `json:"currentPhaseEndDate,omitempty"`
+	// NextPhase is the upcoming phase after the current phase ends
+	// +optional
+	NextPhase string `json:"nextPhase,omitempty"`
+}
+
+// SubscriptionCompatibility contains platform compatibility information from the catalog.
+type SubscriptionCompatibility struct {
+	// CompatiblePlatforms lists platforms and versions this operator version supports
+	// +optional
+	CompatiblePlatforms []PlatformVersions `json:"compatiblePlatforms,omitempty"`
+}
+
+// PlatformVersions lists supported versions for a platform.
+type PlatformVersions struct {
+	// Platform name (e.g., "OpenShift", "Kubernetes")
+	Platform string `json:"platform"`
+	// Versions that are compatible (e.g., ["4.14", "4.15", "4.16"])
+	Versions []string `json:"versions"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object

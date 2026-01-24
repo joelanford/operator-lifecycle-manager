@@ -96,8 +96,29 @@ type PackageManifest struct {
 	// DefaultChannelName is, if specified, the name of the default channel for the package. The
 	// default channel will be installed if no other channel is explicitly given. If the package
 	// has a single channel, then that channel is implicitly the default.
-	DefaultChannelName string       `json:"defaultChannel" yaml:"defaultChannel"`
-	Deprecation        *Deprecation `json:"deprecation,omitempty" yaml:"deprecation,omitempty"`
+	DefaultChannelName string              `json:"defaultChannel" yaml:"defaultChannel"`
+	Deprecation        *Deprecation        `json:"deprecation,omitempty" yaml:"deprecation,omitempty"`
+	VersionLifecycles  []VersionLifecycle  `json:"versionLifecycles,omitempty" yaml:"versionLifecycles,omitempty"`
+}
+
+// VersionLifecycle holds lifecycle metadata for an operator version.
+type VersionLifecycle struct {
+	Version       string                  `json:"version" yaml:"version"`
+	Compatibility []PlatformCompatibility `json:"compatibility,omitempty" yaml:"compatibility,omitempty"`
+	Phases        []LifecyclePhase        `json:"phases,omitempty" yaml:"phases,omitempty"`
+}
+
+// PlatformCompatibility holds platform version compatibility information.
+type PlatformCompatibility struct {
+	Platform string   `json:"platform" yaml:"platform"`
+	Versions []string `json:"versions" yaml:"versions"`
+}
+
+// LifecyclePhase holds lifecycle phase information.
+type LifecyclePhase struct {
+	Name      string `json:"name" yaml:"name"`
+	StartDate string `json:"startDate" yaml:"startDate"`
+	EndDate   string `json:"endDate,omitempty" yaml:"endDate,omitempty"`
 }
 
 // GetDefaultChannel gets the default channel or returns the only one if there's only one. returns empty string if it
@@ -256,6 +277,9 @@ type PackageProperty struct {
 
 	// The version of package in semver format
 	Version string `json:"version" yaml:"version"`
+
+	// The release version of the package in semver pre-release format
+	Release string `json:"release,omitzero" yaml:"release,omitzero"`
 }
 
 type DeprecatedProperty struct {
@@ -286,7 +310,7 @@ func (gd *GVKDependency) Validate() []error {
 func (ld *LabelDependency) Validate() []error {
 	errs := []error{}
 	if *ld == (LabelDependency{}) {
-		// nolint:stylecheck
+		//nolint:staticcheck // ST1005: error message is intentionally capitalized
 		errs = append(errs, fmt.Errorf("Label information is missing"))
 	}
 	return errs
@@ -296,16 +320,14 @@ func (ld *LabelDependency) Validate() []error {
 func (pd *PackageDependency) Validate() []error {
 	errs := []error{}
 	if pd.PackageName == "" {
-		// nolint:stylecheck
 		errs = append(errs, fmt.Errorf("Package name is empty"))
 	}
 	if pd.Version == "" {
-		// nolint:stylecheck
 		errs = append(errs, fmt.Errorf("Package version is empty"))
 	} else {
 		_, err := semver.ParseRange(pd.Version)
 		if err != nil {
-			// nolint:stylecheck
+			//nolint:staticcheck // ST1005: error message is intentionally capitalized
 			errs = append(errs, fmt.Errorf("Invalid semver format version"))
 		}
 	}
@@ -316,18 +338,18 @@ func (pd *PackageDependency) Validate() []error {
 func (cc *CelConstraint) Validate() []error {
 	errs := []error{}
 	if cc.Cel == nil {
-		// nolint:stylecheck
+		//nolint:staticcheck // ST1005: error message is intentionally capitalized
 		errs = append(errs, fmt.Errorf("The CEL field is missing"))
 	} else {
 		if cc.Cel.Rule == "" {
-			// nolint:stylecheck
+			//nolint:staticcheck // ST1005: error message is intentionally capitalized
 			errs = append(errs, fmt.Errorf("The CEL expression is missing"))
 			return errs
 		}
 		validator := constraints.NewCelEnvironment()
 		_, err := validator.Validate(cc.Cel.Rule)
 		if err != nil {
-			// nolint:stylecheck
+			//nolint:staticcheck // ST1005: error message is intentionally capitalized
 			errs = append(errs, fmt.Errorf("Invalid CEL expression: %s", err.Error()))
 		}
 	}

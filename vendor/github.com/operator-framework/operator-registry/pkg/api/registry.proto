@@ -34,6 +34,7 @@ message Package{
 	repeated Channel channels = 2;
 	string defaultChannelName = 3;
 	Deprecation deprecation = 4;
+	repeated VersionLifecycle versionLifecycles = 5;
 }
 
 message GroupVersionKind{
@@ -130,4 +131,21 @@ message GetDefaultProviderRequest{
 
 message Deprecation{
 	string message = 1;
+}
+
+message VersionLifecycle {
+	string version = 1;
+	repeated PlatformCompatibility compatibility = 2;
+	repeated LifecyclePhase phases = 3;
+}
+
+message PlatformCompatibility {
+	string platform = 1;
+	repeated string versions = 2;
+}
+
+message LifecyclePhase {
+	string name = 1;
+	string startDate = 2;
+	string endDate = 3;
 }
