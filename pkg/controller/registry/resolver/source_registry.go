@@ -204,9 +204,28 @@ func (s *registrySource) Snapshot(ctx context.Context) (*cache.Snapshot, error) 
 		return nil, fmt.Errorf("error encountered while listing bundles: %w", err)
 	}
 
+	// Build package info map from version lifecycle data
+	pkgInfoMap := make(map[string]*cache.PackageInfo)
+	for pkgName, p := range packages {
+		versionLifecycles := p.GetVersionLifecycles()
+		if len(versionLifecycles) > 0 {
+			pkgInfo := &cache.PackageInfo{
+				VersionLifecycles: make(map[string]*cache.VersionLifecycleInfo),
+			}
+			for _, vl := range versionLifecycles {
+				pkgInfo.VersionLifecycles[vl.GetVersion()] = &cache.VersionLifecycleInfo{
+					Phases:        vl.GetPhases(),
+					Compatibility: vl.GetCompatibility(),
+				}
+			}
+			pkgInfoMap[pkgName] = pkgInfo
+		}
+	}
+
 	return &cache.Snapshot{
-		Entries: operators,
-		Valid:   s.invalidator.GetValidChannel(s.key),
+		Entries:  operators,
+		Valid:    s.invalidator.GetValidChannel(s.key),
+		Packages: pkgInfoMap,
 	}, nil
 }
 

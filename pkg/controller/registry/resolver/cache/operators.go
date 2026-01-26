@@ -154,6 +154,27 @@ type Deprecations struct {
 	Bundle  *api.Deprecation
 }
 
+// VersionLifecycleInfo contains lifecycle and compatibility data for a package version.
+type VersionLifecycleInfo struct {
+	Phases        []*api.LifecyclePhase
+	Compatibility []*api.PlatformCompatibility
+}
+
+// PackageInfo contains package-level information from the catalog.
+// This provides a natural place for future package-level data.
+type PackageInfo struct {
+	// VersionLifecycles maps minor version string (e.g., "1.2") to lifecycle info
+	VersionLifecycles map[string]*VersionLifecycleInfo
+}
+
+// GetVersionLifecycle returns lifecycle info for the given minor version, or nil if not found.
+func (p *PackageInfo) GetVersionLifecycle(minorVersion string) *VersionLifecycleInfo {
+	if p == nil || p.VersionLifecycles == nil {
+		return nil
+	}
+	return p.VersionLifecycles[minorVersion]
+}
+
 type Entry struct {
 	Name         string
 	Replaces     string

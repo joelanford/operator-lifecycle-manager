@@ -239,15 +239,15 @@ func (c *Cache) Namespaced(namespaces ...string) MultiCatalogOperatorFinder {
 	return &result
 }
 
-func (c *NamespacedOperatorCache) Catalog(k SourceKey) OperatorFinder {
-	// all catalogs match the empty catalog
+func (c *NamespacedOperatorCache) Catalog(k SourceKey) CatalogSnapshot {
 	if k.Empty() {
-		return c
+		// Empty key doesn't identify a specific catalog
+		return EmptyCatalogSnapshot{}
 	}
 	if snapshot, ok := c.snapshots[k]; ok {
 		return snapshot
 	}
-	return EmptyOperatorFinder{}
+	return EmptyCatalogSnapshot{}
 }
 
 func (c *NamespacedOperatorCache) FindPreferred(preferred *SourceKey, preferredNamespace string, p ...Predicate) []*Entry {
@@ -272,6 +272,17 @@ type Snapshot struct {
 
 	// Unless closed, the Snapshot is valid.
 	Valid <-chan struct{}
+
+	// Packages maps package name to package-level information
+	Packages map[string]*PackageInfo
+}
+
+// GetPackageInfo returns package info for the given package name, or nil if not found.
+func (s *Snapshot) GetPackageInfo(pkg string) *PackageInfo {
+	if s == nil || s.Packages == nil {
+		return nil
+	}
+	return s.Packages[pkg]
 }
 
 func ValidOnce() <-chan struct{} {
@@ -406,22 +417,51 @@ func (hdr *snapshotHeader) Find(p ...Predicate) []*Entry {
 	return Filter(hdr.snapshot.Entries, p...)
 }
 
+func (hdr *snapshotHeader) GetPackageInfo(pkg string) *PackageInfo {
+	hdr.m.RLock()
+	defer hdr.m.RUnlock()
+	if hdr.snapshot == nil {
+		return nil
+	}
+	return hdr.snapshot.GetPackageInfo(pkg)
+}
+
 type OperatorFinder interface {
 	Find(...Predicate) []*Entry
 }
 
+// PackageInfoGetter provides access to package-level information from a catalog.
+type PackageInfoGetter interface {
+	GetPackageInfo(pkg string) *PackageInfo
+}
+
+// CatalogSnapshot provides access to a single catalog's operators and package metadata.
+type CatalogSnapshot interface {
+	OperatorFinder
+	PackageInfoGetter
+}
+
 type MultiCatalogOperatorFinder interface {
-	Catalog(SourceKey) OperatorFinder
+	Catalog(SourceKey) CatalogSnapshot
 	FindPreferred(preferred *SourceKey, preferredNamespace string, predicates ...Predicate) []*Entry
 	Error() error
 	OperatorFinder
 }
 
-type EmptyOperatorFinder struct{}
+// EmptyCatalogSnapshot represents a catalog with no operators or package info.
+// Returned when a requested catalog is not found.
+type EmptyCatalogSnapshot struct{}
 
-func (f EmptyOperatorFinder) Find(...Predicate) []*Entry {
+func (EmptyCatalogSnapshot) Find(...Predicate) []*Entry {
 	return nil
 }
+
+func (EmptyCatalogSnapshot) GetPackageInfo(string) *PackageInfo {
+	return nil
+}
+
+// EmptyOperatorFinder is an alias for EmptyCatalogSnapshot for backward compatibility.
+type EmptyOperatorFinder = EmptyCatalogSnapshot
 
 func ExactlyOne(operators []*Entry) (*Entry, error) {
 	if len(operators) != 1 {

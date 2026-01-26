@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
@@ -55,6 +57,7 @@ type catalogHealthReconciler struct {
 	now                       func() *metav1.Time
 	client                    versioned.Interface
 	catalogLister             listers.CatalogSourceLister
+	csvLister                 listers.ClusterServiceVersionLister
 	registryReconcilerFactory reconciler.RegistryReconcilerFactory
 	globalCatalogNamespace    string
 	operatorCacheProvider     cache.OperatorCacheProvider
@@ -86,19 +89,21 @@ func (c *catalogHealthReconciler) Reconcile(ctx context.Context, in kubestate.St
 					break
 				}
 
-				var healthUpdated, deprecationUpdated bool
+				var healthUpdated bool
 				next, healthUpdated = s.UpdateHealth(c.now(), catalogHealth...)
-				if healthUpdated {
-					if _, err := c.client.OperatorsV1alpha1().Subscriptions(ns).UpdateStatus(ctx, s.Subscription(), metav1.UpdateOptions{}); err != nil {
-						return nil, err
-					}
-				}
-				deprecationUpdated, err = c.updateDeprecatedStatus(ctx, s.Subscription())
+
+				deprecationUpdated, err := c.updateDeprecatedStatus(ctx, s.Subscription())
 				if err != nil {
 					return next, err
 				}
-				if deprecationUpdated {
-					_, err = c.client.OperatorsV1alpha1().Subscriptions(ns).UpdateStatus(ctx, s.Subscription(), metav1.UpdateOptions{})
+				lifecycleUpdated, err := c.updateLifecycleStatus(ctx, s.Subscription())
+				if err != nil {
+					return next, err
+				}
+				if healthUpdated || deprecationUpdated || lifecycleUpdated {
+					if _, err := c.client.OperatorsV1alpha1().Subscriptions(ns).UpdateStatus(ctx, s.Subscription(), metav1.UpdateOptions{}); err != nil {
+						return next, err
+					}
 				}
 			case SubscriptionExistsState:
 				if s == nil {
@@ -226,6 +231,189 @@ func (c *catalogHealthReconciler) updateDeprecatedStatus(ctx context.Context, su
 	}
 
 	return true, nil
+}
+
+// updateLifecycleStatus updates lifecycle and compatibility status on the subscription
+// based on the installed CSV's minor version. Returns true if any changes occurred.
+func (c *catalogHealthReconciler) updateLifecycleStatus(_ context.Context, sub *v1alpha1.Subscription) (bool, error) {
+	if c.operatorCacheProvider == nil || c.csvLister == nil {
+		return false, nil
+	}
+
+	// Get the installed CSV name
+	if sub.Status.InstalledCSV == "" {
+		return false, nil
+	}
+
+	// Look up the CSV to get its version
+	csv, err := c.csvLister.ClusterServiceVersions(sub.GetNamespace()).Get(sub.Status.InstalledCSV)
+	if err != nil {
+		// CSV not found - leave status untouched (could be transitional state)
+		return false, nil
+	}
+
+	// Get minor version string from CSV spec.version (e.g., "1.2")
+	// OperatorVersion is a value type wrapping semver.Version, so it's always usable
+	minorVersion := fmt.Sprintf("%d.%d", csv.Spec.Version.Version.Major, csv.Spec.Version.Version.Minor)
+
+	// Lookup lifecycle info via PackageInfo from catalog cache
+	catalogKey := cache.SourceKey{
+		Name:      sub.Spec.CatalogSource,
+		Namespace: sub.Spec.CatalogSourceNamespace,
+	}
+	catalog := c.operatorCacheProvider.Namespaced(sub.Spec.CatalogSourceNamespace).Catalog(catalogKey)
+
+	pkgInfo := catalog.GetPackageInfo(sub.Spec.Package)
+	if pkgInfo == nil {
+		return c.clearLifecycleStatus(sub)
+	}
+
+	lifecycleInfo := pkgInfo.GetVersionLifecycle(minorVersion)
+	if lifecycleInfo == nil {
+		// No lifecycle info for this minor version - clear status
+		return c.clearLifecycleStatus(sub)
+	}
+
+	return c.setLifecycleStatus(sub, lifecycleInfo)
+}
+
+func (c *catalogHealthReconciler) clearLifecycleStatus(sub *v1alpha1.Subscription) (bool, error) {
+	changed := false
+	if sub.Status.Lifecycle != nil {
+		sub.Status.Lifecycle = nil
+		changed = true
+	}
+	if sub.Status.Compatibility != nil {
+		sub.Status.Compatibility = nil
+		changed = true
+	}
+	return changed, nil
+}
+
+func (c *catalogHealthReconciler) setLifecycleStatus(sub *v1alpha1.Subscription, info *cache.VersionLifecycleInfo) (bool, error) {
+	changed := false
+
+	// Build SubscriptionLifecycleStatus from phases
+	var newLifecycle *v1alpha1.SubscriptionLifecycleStatus
+	if len(info.Phases) > 0 {
+		newLifecycle = c.buildLifecycleStatus(info.Phases)
+	}
+	if !lifecycleEqual(sub.Status.Lifecycle, newLifecycle) {
+		sub.Status.Lifecycle = newLifecycle
+		changed = true
+	}
+
+	// Build SubscriptionCompatibility from compatibility
+	var newCompat *v1alpha1.SubscriptionCompatibility
+	if len(info.Compatibility) > 0 {
+		newCompat = c.buildCompatibilityStatus(info.Compatibility)
+	}
+	if !compatibilityEqual(sub.Status.Compatibility, newCompat) {
+		sub.Status.Compatibility = newCompat
+		changed = true
+	}
+
+	return changed, nil
+}
+
+
+func (c *catalogHealthReconciler) buildLifecycleStatus(phases []*api.LifecyclePhase) *v1alpha1.SubscriptionLifecycleStatus {
+	// Find current phase based on current time
+	now := c.now().Time
+	var currentPhase, nextPhase *api.LifecyclePhase
+
+	for _, phase := range phases {
+		startTime, err := time.Parse(time.RFC3339, phase.GetStartDate())
+		if err != nil {
+			continue
+		}
+		var endTime time.Time
+		hasEndDate := phase.GetEndDate() != ""
+		if hasEndDate {
+			endTime, err = time.Parse(time.RFC3339, phase.GetEndDate())
+			if err != nil {
+				continue
+			}
+		}
+
+		// Check if we're in this phase (after start, before end or no end)
+		if !now.Before(startTime) && (!hasEndDate || now.Before(endTime)) {
+			currentPhase = phase
+		} else if now.Before(startTime) && nextPhase == nil {
+			nextPhase = phase
+		}
+	}
+
+	if currentPhase == nil {
+		return nil
+	}
+
+	status := &v1alpha1.SubscriptionLifecycleStatus{
+		CurrentPhase: currentPhase.GetName(),
+	}
+	if currentPhase.GetEndDate() != "" {
+		if endTime, err := time.Parse(time.RFC3339, currentPhase.GetEndDate()); err == nil {
+			t := metav1.NewTime(endTime)
+			status.CurrentPhaseEndDate = &t
+		}
+	}
+	if nextPhase != nil {
+		status.NextPhase = nextPhase.GetName()
+	}
+	return status
+}
+
+func (c *catalogHealthReconciler) buildCompatibilityStatus(compat []*api.PlatformCompatibility) *v1alpha1.SubscriptionCompatibility {
+	// Simply copy the compatibility data to the subscription status.
+	// Let clients determine whether the current platform is compatible.
+	if len(compat) == 0 {
+		return nil
+	}
+	platforms := make([]v1alpha1.PlatformVersions, 0, len(compat))
+	for _, pc := range compat {
+		platforms = append(platforms, v1alpha1.PlatformVersions{
+			Platform: pc.Platform,
+			Versions: pc.Versions,
+		})
+	}
+	return &v1alpha1.SubscriptionCompatibility{
+		CompatiblePlatforms: platforms,
+	}
+}
+
+func lifecycleEqual(a, b *v1alpha1.SubscriptionLifecycleStatus) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	if a.CurrentPhase != b.CurrentPhase {
+		return false
+	}
+	if a.NextPhase != b.NextPhase {
+		return false
+	}
+	// Compare end dates
+	if (a.CurrentPhaseEndDate == nil) != (b.CurrentPhaseEndDate == nil) {
+		return false
+	}
+	if a.CurrentPhaseEndDate != nil && b.CurrentPhaseEndDate != nil {
+		if !a.CurrentPhaseEndDate.Equal(b.CurrentPhaseEndDate) {
+			return false
+		}
+	}
+	return true
+}
+
+func compatibilityEqual(a, b *v1alpha1.SubscriptionCompatibility) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return reflect.DeepEqual(a.CompatiblePlatforms, b.CompatiblePlatforms)
 }
 
 // catalogHealth gets the health of catalogs that can affect Susbcriptions in the given namespace.

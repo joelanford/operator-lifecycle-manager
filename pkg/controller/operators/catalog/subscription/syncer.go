@@ -251,6 +251,7 @@ func newSyncerWithConfig(ctx context.Context, config *syncerConfig) (kubestate.S
 			now:                       s.now,
 			client:                    config.client,
 			catalogLister:             config.lister.OperatorsV1alpha1().CatalogSourceLister(),
+			csvLister:                 config.lister.OperatorsV1alpha1().ClusterServiceVersionLister(),
 			registryReconcilerFactory: config.registryReconcilerFactory,
 			globalCatalogNamespace:    config.globalCatalogNamespace,
 			operatorCacheProvider:     config.operatorCacheProvider,
