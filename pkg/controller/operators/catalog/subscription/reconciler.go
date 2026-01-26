@@ -296,7 +296,11 @@ func (c *catalogHealthReconciler) setLifecycleStatus(sub *v1alpha1.Subscription,
 	// Build SubscriptionLifecycleStatus from phases
 	var newLifecycle *v1alpha1.SubscriptionLifecycleStatus
 	if len(info.Phases) > 0 {
-		newLifecycle = c.buildLifecycleStatus(info.Phases)
+		var err error
+		newLifecycle, err = c.buildLifecycleStatus(info.Phases)
+		if err != nil {
+			return false, fmt.Errorf("failed to build lifecycle status: %w", err)
+		}
 	}
 	if !lifecycleEqual(sub.Status.Lifecycle, newLifecycle) {
 		sub.Status.Lifecycle = newLifecycle
@@ -317,50 +321,131 @@ func (c *catalogHealthReconciler) setLifecycleStatus(sub *v1alpha1.Subscription,
 }
 
 
-func (c *catalogHealthReconciler) buildLifecycleStatus(phases []*api.LifecyclePhase) *v1alpha1.SubscriptionLifecycleStatus {
-	// Find current phase based on current time
-	now := c.now().Time
-	var currentPhase, nextPhase *api.LifecyclePhase
+func (c *catalogHealthReconciler) buildLifecycleStatus(phases []*api.LifecyclePhase) (*v1alpha1.SubscriptionLifecycleStatus, error) {
+	return computeLifecycleStatus(phases, c.now().Time)
+}
+
+// computeLifecycleStatus determines the current and next lifecycle phases based on the
+// provided time. This function is extracted for testability.
+//
+// Phase timeline requirements:
+//   - Exactly one phase MUST have StartDate unset (empty string), meaning it starts at the
+//     beginning of time (time.Time{} zero value). This will be the first phase after sorting.
+//   - Exactly one phase MUST have EndDate unset (empty string), meaning it extends to infinity.
+//     This will be the last phase after sorting.
+//   - Phases must be contiguous and non-overlapping, covering all time from negative infinity
+//     to positive infinity.
+//   - StartDate is inclusive, EndDate is exclusive: a phase covers [startDate, endDate).
+//   - Dates must be in RFC3339 format when present.
+//   - Phases are sorted by StartDate automatically; input order does not matter.
+//
+// Behavior:
+//   - Returns (nil, nil) if phases slice is empty or nil.
+//   - Returns an error if no phase has StartDate unset (no phase starts at beginning of time).
+//   - Returns an error if no phase has EndDate unset (no phase extends to infinity).
+//   - Returns an error if phase dates cannot be parsed.
+//   - The current phase is the one where: startTime <= now < endTime (or no endTime).
+//   - The next phase is the phase immediately following the current phase after sorting.
+func computeLifecycleStatus(phases []*api.LifecyclePhase, now time.Time) (*v1alpha1.SubscriptionLifecycleStatus, error) {
+	if len(phases) == 0 {
+		return nil, nil
+	}
+
+	// Parse all phases first to validate dates
+	type parsedPhase struct {
+		phase     *api.LifecyclePhase
+		startTime time.Time
+		endTime   time.Time
+		hasEnd    bool
+	}
+	parsed := make([]parsedPhase, 0, len(phases))
 
 	for _, phase := range phases {
-		startTime, err := time.Parse(time.RFC3339, phase.GetStartDate())
-		if err != nil {
-			continue
+		var startTime time.Time
+		if phase.GetStartDate() != "" {
+			var err error
+			startTime, err = time.Parse(time.RFC3339, phase.GetStartDate())
+			if err != nil {
+				return nil, fmt.Errorf("invalid StartDate %q for phase %q: %w", phase.GetStartDate(), phase.GetName(), err)
+			}
 		}
+		// startTime defaults to zero value if StartDate is empty
+
 		var endTime time.Time
-		hasEndDate := phase.GetEndDate() != ""
-		if hasEndDate {
+		hasEnd := phase.GetEndDate() != ""
+		if hasEnd {
+			var err error
 			endTime, err = time.Parse(time.RFC3339, phase.GetEndDate())
 			if err != nil {
-				continue
+				return nil, fmt.Errorf("invalid EndDate %q for phase %q: %w", phase.GetEndDate(), phase.GetName(), err)
 			}
 		}
 
-		// Check if we're in this phase (after start, before end or no end)
-		if !now.Before(startTime) && (!hasEndDate || now.Before(endTime)) {
-			currentPhase = phase
-		} else if now.Before(startTime) && nextPhase == nil {
-			nextPhase = phase
+		parsed = append(parsed, parsedPhase{
+			phase:     phase,
+			startTime: startTime,
+			endTime:   endTime,
+			hasEnd:    hasEnd,
+		})
+	}
+
+	// Sort phases by start time (empty StartDate = zero time sorts first)
+	sort.Slice(parsed, func(i, j int) bool {
+		return parsed[i].startTime.Before(parsed[j].startTime)
+	})
+
+	// Validate: first phase (after sorting) must start at beginning of time
+	if parsed[0].phase.GetStartDate() != "" {
+		return nil, fmt.Errorf("no phase starts at beginning of time: first phase %q has StartDate %q", parsed[0].phase.GetName(), parsed[0].phase.GetStartDate())
+	}
+
+	// Validate: last phase (after sorting) must extend to infinity
+	if parsed[len(parsed)-1].hasEnd {
+		return nil, fmt.Errorf("no phase extends to infinity: last phase %q has EndDate %q", parsed[len(parsed)-1].phase.GetName(), parsed[len(parsed)-1].phase.GetEndDate())
+	}
+
+	// Validate: phases must be contiguous (each phase's EndDate == next phase's StartDate)
+	for i := 0; i < len(parsed)-1; i++ {
+		current := parsed[i]
+		next := parsed[i+1]
+		if !current.endTime.Equal(next.startTime) {
+			return nil, fmt.Errorf("phases are not contiguous: phase %q ends at %s but phase %q starts at %s",
+				current.phase.GetName(), current.phase.GetEndDate(),
+				next.phase.GetName(), next.phase.GetStartDate())
 		}
 	}
 
-	if currentPhase == nil {
-		return nil
+	// Find current phase: startTime <= now < endTime (or no end)
+	var currentIdx int = -1
+	for i, p := range parsed {
+		inPhase := !now.Before(p.startTime) && (!p.hasEnd || now.Before(p.endTime))
+		if inPhase {
+			currentIdx = i
+			break // Phases are sorted, first match is the current phase
+		}
 	}
 
+	if currentIdx < 0 {
+		// This shouldn't happen if phases are contiguous, but handle it gracefully
+		return nil, fmt.Errorf("no phase covers the current time")
+	}
+
+	current := parsed[currentIdx]
 	status := &v1alpha1.SubscriptionLifecycleStatus{
-		CurrentPhase: currentPhase.GetName(),
+		CurrentPhase: current.phase.GetName(),
 	}
-	if currentPhase.GetEndDate() != "" {
-		if endTime, err := time.Parse(time.RFC3339, currentPhase.GetEndDate()); err == nil {
-			t := metav1.NewTime(endTime)
-			status.CurrentPhaseEndDate = &t
-		}
+
+	if current.hasEnd {
+		t := metav1.NewTime(current.endTime)
+		status.CurrentPhaseEndDate = &t
 	}
-	if nextPhase != nil {
-		status.NextPhase = nextPhase.GetName()
+
+	// Next phase is the one immediately after current in the slice
+	if currentIdx+1 < len(parsed) {
+		status.NextPhase = parsed[currentIdx+1].phase.GetName()
 	}
-	return status
+
+	return status, nil
 }
 
 func (c *catalogHealthReconciler) buildCompatibilityStatus(compat []*api.PlatformCompatibility) *v1alpha1.SubscriptionCompatibility {

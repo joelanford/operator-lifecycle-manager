@@ -16,6 +16,7 @@ import (
 
 	"github.com/operator-framework/api/pkg/operators/v1alpha1"
 	versionedfake "github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/clientset/versioned/fake"
+	"github.com/operator-framework/operator-registry/pkg/api"
 	"github.com/operator-framework/operator-lifecycle-manager/pkg/api/client/informers/externalversions"
 	registryreconciler "github.com/operator-framework/operator-lifecycle-manager/pkg/controller/registry/reconciler"
 	olmfakes "github.com/operator-framework/operator-lifecycle-manager/pkg/fakes"
@@ -1849,4 +1850,210 @@ func withInstallPlanStatus(plan *v1alpha1.InstallPlan, status *v1alpha1.InstallP
 	plan.Status = *status
 
 	return plan
+}
+
+func TestComputeLifecycleStatus(t *testing.T) {
+	// Helper to create a phase
+	phase := func(name, start, end string) *api.LifecyclePhase {
+		return &api.LifecyclePhase{
+			Name:      name,
+			StartDate: start,
+			EndDate:   end,
+		}
+	}
+
+	// Reference times
+	t2025 := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	t2026 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	t2028 := time.Date(2028, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name           string
+		phases         []*api.LifecyclePhase
+		now            time.Time
+		wantNil        bool
+		wantErr        bool
+		wantErrContain string
+		wantCurrent    string
+		wantNext       string
+		wantEndDateNil bool
+	}{
+		{
+			name:    "nil phases returns nil",
+			phases:  nil,
+			now:     t2026,
+			wantNil: true,
+		},
+		{
+			name:    "empty phases returns nil",
+			phases:  []*api.LifecyclePhase{},
+			now:     t2026,
+			wantNil: true,
+		},
+		{
+			name: "single phase with no start or end (covers all time)",
+			phases: []*api.LifecyclePhase{
+				phase("GA", "", ""),
+			},
+			now:            t2026,
+			wantCurrent:    "GA",
+			wantNext:       "",
+			wantEndDateNil: true,
+		},
+		{
+			name: "no phase with empty StartDate returns error",
+			phases: []*api.LifecyclePhase{
+				phase("GA", "2025-01-01T00:00:00Z", ""),
+			},
+			now:            t2026,
+			wantErr:        true,
+			wantErrContain: "no phase starts at beginning of time",
+		},
+		{
+			name: "no phase with empty EndDate returns error",
+			phases: []*api.LifecyclePhase{
+				phase("GA", "", "2026-01-01T00:00:00Z"),
+			},
+			now:            t2025,
+			wantErr:        true,
+			wantErrContain: "no phase extends to infinity",
+		},
+		{
+			name: "two phases - in first phase",
+			phases: []*api.LifecyclePhase{
+				phase("GA", "", "2026-01-01T00:00:00Z"),
+				phase("maintenance", "2026-01-01T00:00:00Z", ""),
+			},
+			now:         t2025,
+			wantCurrent: "GA",
+			wantNext:    "maintenance",
+		},
+		{
+			name: "two phases - exactly at boundary (exclusive end, moves to next)",
+			phases: []*api.LifecyclePhase{
+				phase("GA", "", "2026-01-01T00:00:00Z"),
+				phase("maintenance", "2026-01-01T00:00:00Z", ""),
+			},
+			now:            t2026,
+			wantCurrent:    "maintenance",
+			wantNext:       "",
+			wantEndDateNil: true,
+		},
+		{
+			name: "multiple phases - in middle phase",
+			phases: []*api.LifecyclePhase{
+				phase("tech-preview", "", "2026-01-01T00:00:00Z"),
+				phase("GA", "2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z"),
+				phase("maintenance", "2027-01-01T00:00:00Z", "2028-01-01T00:00:00Z"),
+				phase("EOL", "2028-01-01T00:00:00Z", ""),
+			},
+			now:         time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC),
+			wantCurrent: "GA",
+			wantNext:    "maintenance",
+		},
+		{
+			name: "multiple phases - in last phase",
+			phases: []*api.LifecyclePhase{
+				phase("GA", "", "2027-01-01T00:00:00Z"),
+				phase("maintenance", "2027-01-01T00:00:00Z", "2028-01-01T00:00:00Z"),
+				phase("EOL", "2028-01-01T00:00:00Z", ""),
+			},
+			now:            t2028,
+			wantCurrent:    "EOL",
+			wantNext:       "",
+			wantEndDateNil: true,
+		},
+		{
+			name: "phases out of order are sorted correctly",
+			phases: []*api.LifecyclePhase{
+				phase("EOL", "2028-01-01T00:00:00Z", ""),
+				phase("GA", "", "2027-01-01T00:00:00Z"),
+				phase("maintenance", "2027-01-01T00:00:00Z", "2028-01-01T00:00:00Z"),
+			},
+			now:         time.Date(2027, 6, 15, 0, 0, 0, 0, time.UTC),
+			wantCurrent: "maintenance",
+			wantNext:    "EOL",
+		},
+		{
+			name: "in first phase (beginning of time)",
+			phases: []*api.LifecyclePhase{
+				phase("early", "", "2025-01-01T00:00:00Z"),
+				phase("GA", "2025-01-01T00:00:00Z", ""),
+			},
+			now:         time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC),
+			wantCurrent: "early",
+			wantNext:    "GA",
+		},
+		{
+			name: "invalid start date returns error",
+			phases: []*api.LifecyclePhase{
+				phase("early", "", "2025-01-01T00:00:00Z"),
+				phase("GA", "not-a-date", ""),
+			},
+			now:            t2026,
+			wantErr:        true,
+			wantErrContain: "invalid StartDate",
+		},
+		{
+			name: "invalid end date returns error",
+			phases: []*api.LifecyclePhase{
+				phase("GA", "", "not-a-date"),
+			},
+			now:            t2026,
+			wantErr:        true,
+			wantErrContain: "invalid EndDate",
+		},
+		{
+			name: "non-contiguous phases returns error",
+			phases: []*api.LifecyclePhase{
+				phase("GA", "", "2025-01-01T00:00:00Z"),
+				phase("EOL", "2026-01-01T00:00:00Z", ""), // gap between 2025 and 2026
+			},
+			now:            t2026,
+			wantErr:        true,
+			wantErrContain: "phases are not contiguous",
+		},
+		{
+			name: "time far in the future with open-ended last phase",
+			phases: []*api.LifecyclePhase{
+				phase("GA", "", "2027-01-01T00:00:00Z"),
+				phase("EOL", "2027-01-01T00:00:00Z", ""),
+			},
+			now:            time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC),
+			wantCurrent:    "EOL",
+			wantNext:       "",
+			wantEndDateNil: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := computeLifecycleStatus(tt.phases, tt.now)
+
+			if tt.wantErr {
+				require.Error(t, err)
+				if tt.wantErrContain != "" {
+					require.Contains(t, err.Error(), tt.wantErrContain)
+				}
+				return
+			}
+
+			require.NoError(t, err)
+
+			if tt.wantNil {
+				require.Nil(t, result)
+				return
+			}
+
+			require.NotNil(t, result)
+			require.Equal(t, tt.wantCurrent, result.CurrentPhase)
+			require.Equal(t, tt.wantNext, result.NextPhase)
+
+			if tt.wantEndDateNil {
+				require.Nil(t, result.CurrentPhaseEndDate)
+			} else {
+				require.NotNil(t, result.CurrentPhaseEndDate)
+			}
+		})
+	}
 }
